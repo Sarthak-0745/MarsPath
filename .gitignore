@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Trained models (large binary files -- not meant for git)
+models/
+
+# Raw and processed terrain data (large DEM files, generated maps)
+data/raw/
+data/processed*/
+
+# Logs and experiment tracking
+logs/
+wandb/
+
+# Generated outputs (renders, csvs -- regenerate from scripts instead of committing)
+outputs/*
+!outputs/*.png
+!outputs/*.csv
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
