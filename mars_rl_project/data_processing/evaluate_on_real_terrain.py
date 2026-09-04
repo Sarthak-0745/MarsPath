@@ -1,17 +1,37 @@
 """
 evaluate_on_real_terrain.py
 
-Step 6: evaluate an already-trained DQN/PPO model (from train_dqn.py /
-train_ppo.py) on REAL Jezero Crater terrain maps (from
-process_nasa_terrain.py), instead of synthetic terrain. This is the
-"sim-to-real" test: does a policy that learned to navigate synthetic
-obstacle fields actually transfer to genuine Mars topography?
+Project 2a update: evaluate a trained model -- masked (MaskableDQN /
+MaskablePPO from Project 2a) or unmasked (plain DQN / PPO from MarsPath)
+-- on real Jezero Crater terrain maps. Same 50-map stratified real-terrain
+set as MarsPath; no changes to map loading, cycle detection, or the
+success/collision/timeout accounting, so Project 2a numbers are directly
+comparable to MarsPath's baseline numbers in the paper.
+
+New in this version:
+    --masked            wrap the eval env in HistoryActionMaskWrapper and
+                         drive the model with masked predict() calls
+                         (required for MaskableDQN/MaskablePPO models;
+                         must be OMITTED for MarsPath's original
+                         unmasked DQN/PPO models, which don't expect a
+                         wrapped observation/action-selection path)
+    --history-len N      masking window, must match what the model was
+                         trained with (default 15)
+
+With --masked, cycle detection (detect_cycle) is still run on the
+resulting path for reporting, but a true cycle should now be
+structurally impossible for the masked model within any window <=
+history_len -- if detect_cycle still fires, that's a real finding
+worth flagging (e.g. a longer-period cycle than the mask window
+prevents, or a cycle that predates the mask -- shouldn't happen since
+the mask is active from step 1, but report exactly what detect_cycle's
+period distribution looks like either way).
 
 Usage:
     python -m mars_rl_project.data_processing.evaluate_on_real_terrain \
-        --model models/dqn_easy/final_model.zip \
+        --model models/dqn_masked_easy/final_model.zip \
         --maps-dir data/processed \
-        --algo dqn
+        --algo dqn --masked
 """
 
 from __future__ import annotations
@@ -20,25 +40,27 @@ from pathlib import Path
 
 import numpy as np
 from stable_baselines3 import DQN, PPO
+from sb3_contrib import MaskablePPO
 
 from mars_rl_project.environments import MarsTerrainEnv
+from mars_rl_project.masking.history_mask import HistoryActionMaskWrapper
+from mars_rl_project.masking.maskable_dqn import MaskableDQN
+from mars_rl_project.masking.eval_utils import get_action_masks
 from mars_rl_project.data_processing.render_failure_case import render
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-ALGO_CLASSES = {"dqn": DQN, "ppo": PPO}
+# Masked and unmasked model classes both keyed by --algo; --masked picks
+# which row of this table is used to .load() the model.
+ALGO_CLASSES = {
+    "dqn": {"unmasked": DQN, "masked": MaskableDQN},
+    "ppo": {"unmasked": PPO, "masked": MaskablePPO},
+}
 
 
 def detect_cycle(path: list, max_period: int = 6, min_repeats: int = 3) -> int | None:
-    """
-    Checks whether the END of the path is a short repeating loop (as seen in
-    jezero_map_03: a period-3 cycle the agent never escapes). Returns the
-    cycle period (e.g. 3) if one is found ending at the final position,
-    else None. This distinguishes "agent got stuck in a deterministic loop"
-    from "agent is still genuinely searching/wandering" -- both currently
-    show up as termination_reason='timeout', but they're different failure
-    modes worth reporting separately.
-    """
+    """Unchanged from MarsPath -- checks whether the END of the path is a
+    short repeating loop. See MarsPath's original docstring for details."""
     n = len(path)
     for period in range(1, max_period + 1):
         needed = period * min_repeats
@@ -66,8 +88,10 @@ def load_maps(maps_dir: Path) -> list[dict]:
 
 def evaluate_model_on_maps(model, maps: list[dict], max_steps: int = 200,
                             render_dir: Path | None = None, run_name: str = "model",
-                            deterministic: bool = True) -> dict:
-    env = MarsTerrainEnv(grid_size=maps[0]["grid"].shape[0], max_steps=max_steps)
+                            deterministic: bool = True, masked: bool = False,
+                            history_len: int = 15) -> dict:
+    base_env = MarsTerrainEnv(grid_size=maps[0]["grid"].shape[0], max_steps=max_steps)
+    env = HistoryActionMaskWrapper(base_env, history_len=history_len) if masked else base_env
 
     results = {"success": 0, "collision": 0, "timeout": 0}
     rewards, ep_lengths = [], []
@@ -82,7 +106,11 @@ def evaluate_model_on_maps(model, maps: list[dict], max_steps: int = 200,
         total_reward = 0.0
         terminated = truncated = False
         while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=deterministic)
+            if masked:
+                action_masks = get_action_masks(env)
+                action, _ = model.predict(obs, deterministic=deterministic, action_masks=action_masks)
+            else:
+                action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, info = env.step(int(action))
             path.append(info["position"])
             total_reward += reward
@@ -118,6 +146,12 @@ def evaluate_model_on_maps(model, maps: list[dict], max_steps: int = 200,
         "mean_ep_length": float(np.mean(ep_lengths)),
         "per_map": per_map_outcomes,
     }
+    if masked:
+        # Diagnostic from history_mask.py design assumption 3 -- how often
+        # did the eval env get boxed in on all 8 sides by its own recent
+        # history across this whole 50-map run?
+        summary["all_masked_events"] = env.get_wrapper_attr("all_masked_events")
+        summary["all_masked_steps_total"] = env.get_wrapper_attr("total_steps")
     return summary
 
 
@@ -133,6 +167,11 @@ def print_summary(label: str, summary: dict):
           f"(agent stuck in a short repeating loop, never a genuine collision/wander-forever)")
     print(f"Mean reward    : {summary['mean_reward']:.2f} (+/- {summary['std_reward']:.2f})")
     print(f"Mean ep length : {summary['mean_ep_length']:.1f}")
+    if "all_masked_events" in summary:
+        n = summary["all_masked_steps_total"]
+        k = summary["all_masked_events"]
+        rate = (k / n * 100) if n else 0.0
+        print(f"All-masked fallback fired: {k}/{n} steps ({rate:.3f}%) across this eval run")
     print(f"\nPer-map results:")
     for name, outcome, reward, steps in summary["per_map"]:
         print(f"  {name:<20} {outcome:<10} reward={reward:>7.2f} steps={steps}")
@@ -144,13 +183,17 @@ def main():
                          help="Path to a saved model .zip (from train_dqn.py or train_ppo.py)")
     parser.add_argument("--algo", choices=["dqn", "ppo"], required=True,
                          help="Which algorithm the model was trained with")
+    parser.add_argument("--masked", action="store_true",
+                         help="Set for Project 2a models (MaskableDQN/MaskablePPO). Omit for "
+                              "MarsPath's original unmasked DQN/PPO models.")
+    parser.add_argument("--history-len", type=int, default=15,
+                         help="Masking window -- must match training (default: 15). Ignored "
+                              "unless --masked is set.")
     parser.add_argument("--maps-dir", type=Path, default=PROJECT_ROOT / "data" / "processed",
                          help="Directory of .npz real-terrain maps from process_nasa_terrain.py")
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--render-all", action="store_true",
-                         help="Save a PNG (terrain + agent path + outcome) for EVERY map, not just "
-                              "one -- same visual as render_failure_case.py, generated for the "
-                              "whole evaluation set in one pass. Saved to outputs/eval_renders/<run_name>/")
+                         help="Save a PNG for every map to outputs/eval_renders/<run_name>/")
     args = parser.parse_args()
 
     if not args.model.exists():
@@ -160,8 +203,9 @@ def main():
             f"No .npz maps found in {args.maps_dir}. Run process_nasa_terrain.py first."
         )
 
-    print(f"Loading {args.algo.upper()} model: {args.model}")
-    model = ALGO_CLASSES[args.algo].load(str(args.model))
+    model_cls = ALGO_CLASSES[args.algo]["masked" if args.masked else "unmasked"]
+    print(f"Loading {'masked ' if args.masked else ''}{args.algo.upper()} model: {args.model}")
+    model = model_cls.load(str(args.model))
 
     print(f"Loading real-terrain maps from: {args.maps_dir}")
     maps = load_maps(args.maps_dir)
@@ -172,13 +216,16 @@ def main():
     if render_dir:
         print(f"Rendering a PNG for every map to: {render_dir}")
 
-    summary = evaluate_model_on_maps(model, maps, args.max_steps, render_dir=render_dir, run_name=run_name)
+    summary = evaluate_model_on_maps(
+        model, maps, args.max_steps, render_dir=render_dir, run_name=run_name,
+        masked=args.masked, history_len=args.history_len,
+    )
     print_summary(f"Real-terrain evaluation: {run_name}", summary)
 
     print(
-        f"\nCompare these numbers against this model's synthetic eval/mean_reward "
-        f"from its W&B run to see how well it transfers from synthetic training "
-        f"terrain to genuine Mars topography."
+        f"\nCompare these numbers against MarsPath's baseline (unmasked) real-terrain "
+        f"numbers for the same difficulty/algorithm to see whether history-aware masking "
+        f"reduced the timeout/cycle rate."
     )
 
 
