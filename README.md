@@ -10,7 +10,7 @@ This project trains DQN and PPO agents to navigate a custom Gymnasium environmen
 
 **Central finding (structural fix):** rather than stopping at diagnosis, this project designs, implements, and validates a structural fix — history-aware hard action masking, which forbids the agent from selecting any action that would return it to a recently visited position. This eliminates cycling completely (0.0 ± 0.0% cycle rate, both algorithms, all difficulty tiers) but trades it for a higher collision rate. Layering a terrain-safety constraint on top — using information already present in the agent's own observation — resolves this trade-off, yielding **92–94% success across all six algorithm-difficulty configurations** and closing the substantial DQN–PPO capability gap present in the original evaluation (DQN Hard: 2.0% → 92.8%). Welch's t-tests confirm every improvement is statistically significant (most p<0.0001). SHAP analysis extended to the masked models shows direction-dominant attribution across every outcome, confirming the fix addresses the root cause rather than papering over symptoms. Implementing the masking fix also surfaced and required correcting a latent value-estimation instability in masked off-policy (DQN) learning.
 
-See `MarsPath Report/MarsPath.pdf` for the full research report.
+See `MarsPath Report/MarsPath 2.0.pdf` for the full research report.
 
 ---
 
